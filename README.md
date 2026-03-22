@@ -448,46 +448,6 @@ Multi-turn Q&A about an analysed prescription.
 
 ---
 
-## Design Decisions
-
-### Why LangGraph instead of a simple function chain?
-
-A plain Python function chain (step1 → step2 → step3) cannot express:
-- **Cycles** — retrying OCR with a different strategy if confidence is low
-- **Conditional routing** — taking different code paths based on risk level
-- **Parallel execution** — running reasoning and risk detection simultaneously
-- **Checkpointed memory** — persisting conversation state across HTTP requests
-
-LangGraph provides all of this declaratively, with the graph topology as the source of truth for control flow.
-
-### Why three separate LLM calls instead of one mega-prompt?
-
-| Concern | Single prompt | Multi-step |
-|---|---|---|
-| Debuggability | Hard — which part failed? | Each node is independently testable |
-| Prompt quality | One prompt doing too much | Each prompt is laser-focused |
-| Structured output | One massive schema | Small, precise Pydantic models per step |
-| Retries | Retry everything | Retry only the failing step |
-| Explainability | Black box | `processing_steps` audit trail per node |
-
-### Why Gemini Flash for OCR instead of Tesseract?
-
-Tesseract is rule-based and struggles severely with handwriting. Gemini Flash's vision capability handles handwritten prescriptions, mixed fonts, stamps, and poor lighting — and it's free tier. Using the same model for OCR and reasoning also eliminates an extra dependency.
-
-### Why `.with_structured_output()` instead of prompt-engineered JSON?
-
-Prompt-engineered JSON parsing is fragile — the model might return malformed JSON, miss fields, or add extra commentary. LangChain's `.with_structured_output(PydanticModel)` enforces the schema at the API level (using Gemini's function calling mode), giving us validated, typed Python objects with zero parsing code.
-
-### Why `operator.add` reducers on list fields?
-
-When `reasoning_node` and `risk_node` run in parallel, both may append to `warnings` and `processing_steps`. Without a reducer, the second write would overwrite the first. `Annotated[list[str], operator.add]` tells LangGraph to **concatenate** both writes — a fundamental pattern for safe parallel state mutation.
-
-### Why two compiled graph instances?
-
-`MemorySaver` checkpointing has overhead — it serialises and stores full graph state after every node. For stateless endpoints (`/upload-prescription`, `/analyze`) this is wasteful. By compiling two instances (one with, one without checkpointer), stateless calls stay fast while the chat endpoint gets full memory persistence.
-
----
-
 ## Project Structure
 
 ```
@@ -598,20 +558,3 @@ Open `http://localhost:8000/docs` for the interactive Swagger UI.
 - Real-time feedback loop — pharmacist corrections improve prompts over time
 
 ---
-
-## Interview Talking Points
-
-**Q: Why multi-agent instead of a single LLM call?**
-Each node has a single responsibility — OCR, structuring, reasoning, risk. This means targeted prompts, precise Pydantic schemas per step, independent retries, and a full audit trail via `processing_steps`. A single call would produce one unvalidated blob of JSON that's impossible to debug.
-
-**Q: How does LangGraph handle the OCR retry loop?**
-`enhance_ocr` node increments `ocr_retry_count` in state and routes back to `ocr`. The `route_ocr_quality` conditional edge checks the counter against `MAX_OCR_RETRIES`. When the budget is exhausted it routes to `flag_unreadable` instead. This is a proper graph cycle — not a Python while loop.
-
-**Q: How is parallel execution safe?**
-`reasoning_node` and `risk_node` write to different state keys (`interpretation` vs `risk_assessment`). For shared list fields (`warnings`, `processing_steps`), LangGraph uses `operator.add` reducers — it concatenates both nodes' writes rather than letting one overwrite the other.
-
-**Q: Why Gemini for OCR instead of Tesseract?**
-Tesseract is rule-based OCR optimised for printed text. Handwritten prescriptions, mixed fonts, rubber stamps, and rotated text defeat it. Gemini Flash's multimodal vision handles all of these — and it's the same model used for LLM reasoning, so no extra dependency or latency for a separate OCR service.
-
-**Q: What happens when the image is completely unreadable?**
-After `MAX_OCR_RETRIES` attempts, `route_ocr_quality` routes to `flag_unreadable_node` — a terminal node that sets a structured error in state and routes to `END`. The API returns a `status: failed` response with a clear message directing the user to the `/analyze` endpoint for manual text entry.
